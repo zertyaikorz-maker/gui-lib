@@ -1,2 +1,316 @@
--- GUI lib simple and support low unc executor
-local = 
+@echo off
+chp < 65001
+:: ============================================================
+::  MALWARE MONITOR - Advanced Screen & App Threat Detector
+::  Monitors active apps, browser URLs, and checks for threats
+::  Logs detections to: logs\threat_log.txt
+:: ============================================================
+title Malware Monitor - Running
+setlocal enabledelayedexpansion
+
+:: --- CONFIG ---
+set SCAN_INTERVAL=5
+set LOG_DIR=%~dp0logs
+set LOG_FILE=%LOG_DIR%\threat_log.txt
+set ALERT_FILE=%LOG_DIR%\alerts.txt
+set VT_API_KEY=YOUR_VIRUSTOTAL_API_KEY_HERE
+
+:: Create logs directory
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+
+:: Write header to log
+echo ================================================================ >> "%LOG_FILE%"
+echo  MALWARE MONITOR STARTED: %DATE% %TIME% >> "%LOG_FILE%"
+echo ================================================================ >> "%LOG_FILE%"
+
+echo.
+echo  ╔══════════════════════════════════════════╗
+echo  ║       MALWARE MONITOR  - ACTIVE          ║
+echo  ║  Scanning every %SCAN_INTERVAL% seconds               ║
+echo  ║  Logs saved to: logs\threat_log.txt      ║
+echo  ║  Press CTRL+C to stop                    ║
+echo  ╚══════════════════════════════════════════╝
+echo.
+
+:MAIN_LOOP
+call :RUN_SCAN
+timeout /t %SCAN_INTERVAL% /nobreak >nul
+goto MAIN_LOOP
+
+:: ============================================================
+:RUN_SCAN
+:: Runs full scan: active window, browser URLs, processes
+:: ============================================================
+
+:: --- Extract active window title and process ---
+for /f "tokens=*" %%A in ('powershell -NoProfile -Command ^
+    "$proc = Get-Process | Where-Object {$_.MainWindowTitle -ne ''} | Sort-Object CPU -Descending | Select-Object -First 1; if ($proc) { Write-Output ($proc.ProcessName + '|' + $proc.MainWindowTitle) }"') do (
+    set "ACTIVE_INFO=%%A"
+)
+
+for /f "delims=|" %%A in ("!ACTIVE_INFO!") do set "PROC_NAME=%%A"
+for /f "tokens=2 delims=|" %%A in ("!ACTIVE_INFO!") do set "WINDOW_TITLE=%%A"
+
+if "!PROC_NAME!"=="" set "PROC_NAME=Unknown"
+if "!WINDOW_TITLE!"=="" set "WINDOW_TITLE=Unknown"
+
+echo [%TIME%] App: !PROC_NAME! ^| Window: !WINDOW_TITLE!
+
+:: --- Extract URL from browser window title ---
+set "CURRENT_URL="
+set "CURRENT_DOMAIN="
+
+powershell -NoProfile -Command ^
+    "$browsers = @('chrome','firefox','msedge','opera','brave','vivaldi','iexplore'); " ^
+    "$activeProc = Get-Process | Where-Object {$_.MainWindowTitle -ne ''} | Sort-Object CPU -Descending | Select-Object -First 1; " ^
+    "if ($activeProc -and ($browsers -contains $activeProc.ProcessName.ToLower())) { " ^
+    "  $title = $activeProc.MainWindowTitle; " ^
+    "  $patterns = @('https?://[^\s/]+','[a-zA-Z0-9.-]+\.(com|net|org|io|gov|edu|co\.[a-z]{2}|xyz|info|biz|ru|cn|tk|ml|ga|cf|gq)'); " ^
+    "  foreach ($p in $patterns) { if ($title -match $p) { $env:EXTRACTED_DOMAIN = $matches[0]; break } } " ^
+    "  Write-Output $env:EXTRACTED_DOMAIN " ^
+    "}" > "%TEMP%\domain_tmp.txt" 2>nul
+
+set /p CURRENT_DOMAIN=< "%TEMP%\domain_tmp.txt"
+
+:: Also try to get URL from browser via UIAutomation / address bar
+powershell -NoProfile -Command ^
+    "Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes; " ^
+    "try { " ^
+    "  $root = [System.Windows.Automation.AutomationElement]::RootElement; " ^
+    "  $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit); " ^
+    "  $focused = [System.Windows.Automation.AutomationElement]::FocusedElement; " ^
+    "  $browsers = @('chrome','firefox','msedge','opera','brave','vivaldi'); " ^
+    "  $win = Get-Process | Where-Object {$_.MainWindowTitle -ne '' -and ($browsers -contains $_.ProcessName.ToLower())} | Sort-Object CPU -Descending | Select-Object -First 1; " ^
+    "  if ($win) { " ^
+    "    $hwnd = $win.MainWindowHandle; " ^
+    "    $element = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd); " ^
+    "    $editCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Edit); " ^
+    "    $edits = $element.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCond); " ^
+    "    foreach ($e in $edits) { " ^
+    "      $vp = $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); " ^
+    "      $val = $vp.Current.Value; " ^
+    "      if ($val -match 'https?://') { Write-Output $val; break } " ^
+    "    } " ^
+    "  } " ^
+    "} catch {}" > "%TEMP%\url_tmp.txt" 2>nul
+
+set /p FULL_URL=< "%TEMP%\url_tmp.txt"
+if not "!FULL_URL!"=="" set "CURRENT_URL=!FULL_URL!"
+
+:: Extract domain from full URL if found
+if not "!CURRENT_URL!"=="" (
+    for /f "tokens=*" %%D in ('powershell -NoProfile -Command ^
+        "try { $u = [System.Uri]'!CURRENT_URL!'; Write-Output $u.Host } catch { Write-Output '' }"') do (
+        set "CURRENT_DOMAIN=%%D"
+    )
+)
+
+if not "!CURRENT_DOMAIN!"=="" (
+    echo [%TIME%] Browser Domain Detected: !CURRENT_DOMAIN!
+)
+
+:: --- Run Threat Checks ---
+call :CHECK_PROCESS_THREATS "!PROC_NAME!"
+call :CHECK_DOMAIN_THREATS "!CURRENT_DOMAIN!" "!CURRENT_URL!"
+call :CHECK_SUSPICIOUS_PROCESSES
+call :CHECK_NETWORK_CONNECTIONS
+
+exit /b
+
+:: ============================================================
+:CHECK_PROCESS_THREATS
+:: Checks running process name against known malware names
+:: ============================================================
+set "TARGET_PROC=%~1"
+if "%TARGET_PROC%"=="" exit /b
+if "%TARGET_PROC%"=="Unknown" exit /b
+
+set "MALWARE_PROCS=cryptominer miner xmrig minerd coinminer keylogger spyware trojan ransomware adware njrat darkcomet netbus subseven remcos asyncrat nanocore quasar remoteadmin radmin ammyy anydesk teamviewer_service vnchooks xtreme hktl wce mimikatz pwdump hashdump netcat ncat socat metasploit msfconsole psexec"
+
+for %%M in (%MALWARE_PROCS%) do (
+    echo !TARGET_PROC! | findstr /i "%%M" >nul 2>&1
+    if not errorlevel 1 (
+        call :LOG_THREAT "PROCESS" "!TARGET_PROC!" "Matches known malware process name: %%M" "HIGH"
+    )
+)
+
+:: Check process entropy (packed/obfuscated EXE = suspicious)
+powershell -NoProfile -Command ^
+    "try { " ^
+    "  $proc = Get-Process -Name '%TARGET_PROC%' -ErrorAction SilentlyContinue | Select-Object -First 1; " ^
+    "  if ($proc -and $proc.Path) { " ^
+    "    $bytes = [System.IO.File]::ReadAllBytes($proc.Path); " ^
+    "    $freq = @{}; foreach ($b in $bytes) { $freq[$b]++ }; " ^
+    "    $entropy = 0; $len = $bytes.Length; " ^
+    "    foreach ($k in $freq.Keys) { $p = $freq[$k]/$len; if ($p -gt 0) { $entropy -= $p * [Math]::Log($p,2) } }; " ^
+    "    if ($entropy -gt 7.2) { Write-Output ('HIGH_ENTROPY:' + [Math]::Round($entropy,3) + ':' + $proc.Path) } " ^
+    "  } " ^
+    "} catch {}" > "%TEMP%\entropy_tmp.txt" 2>nul
+
+set /p ENTROPY_RESULT=< "%TEMP%\entropy_tmp.txt"
+if not "!ENTROPY_RESULT!"=="" (
+    for /f "tokens=1,2,3 delims=:" %%A in ("!ENTROPY_RESULT!") do (
+        call :LOG_THREAT "PROCESS" "%TARGET_PROC%" "High entropy detected (%%B) - possible packed/obfuscated executable at %%C" "MEDIUM"
+    )
+)
+
+exit /b
+
+:: ============================================================
+:CHECK_DOMAIN_THREATS
+:: Checks domain against known malicious list + VirusTotal
+:: ============================================================
+set "TARGET_DOMAIN=%~1"
+set "TARGET_URL=%~2"
+if "%TARGET_DOMAIN%"=="" exit /b
+
+:: --- Known malicious TLDs and patterns ---
+echo !TARGET_DOMAIN! | findstr /i "\.tk$ \.ml$ \.ga$ \.cf$ \.gq$ \.xyz$ \.top$ \.pw$ \.cc$ \.ws$ \.su$" >nul 2>&1
+if not errorlevel 1 (
+    call :LOG_THREAT "DOMAIN" "!TARGET_DOMAIN!" "Suspicious TLD commonly used for malware/phishing" "MEDIUM"
+)
+
+:: --- Phishing keyword patterns ---
+set "PHISH_KEYWORDS=paypal-secure secure-paypal apple-verify verify-apple amazon-login login-amazon microsoft-verify account-suspended suspended-account netflix-billing update-payment payment-update bankofamerica-secure"
+for %%K in (%PHISH_KEYWORDS%) do (
+    echo !TARGET_DOMAIN! | findstr /i "%%K" >nul 2>&1
+    if not errorlevel 1 (
+        call :LOG_THREAT "PHISHING" "!TARGET_DOMAIN!" "Domain matches phishing pattern: %%K" "HIGH"
+    )
+)
+
+:: --- IP address as domain (suspicious) ---
+echo !TARGET_DOMAIN! | findstr /r "^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$" >nul 2>&1
+if not errorlevel 1 (
+    call :LOG_THREAT "DOMAIN" "!TARGET_DOMAIN!" "Visiting raw IP address - no domain name (suspicious)" "MEDIUM"
+)
+
+:: --- Known malware C2 / bad domains (local blocklist) ---
+set "BADDOMAINS=evil.com malware-site.net phishing-test.com trojan-host.ru botnet-c2.xyz cryptojacking.ml spyware-download.tk freeware-crack.top warez-hub.cc nulled.to cracking-site.pw"
+for %%B in (%BADDOMAINS%) do (
+    if /i "!TARGET_DOMAIN!"=="%%B" (
+        call :LOG_THREAT "DOMAIN" "!TARGET_DOMAIN!" "Matches known malicious domain blocklist" "CRITICAL"
+    )
+)
+
+:: --- VirusTotal API check (only if API key is set) ---
+if not "%VT_API_KEY%"=="YOUR_VIRUSTOTAL_API_KEY_HERE" (
+    if not "%TARGET_DOMAIN%"=="" (
+        call :CHECK_VIRUSTOTAL "!TARGET_DOMAIN!"
+    )
+)
+
+exit /b
+
+:: ============================================================
+:CHECK_VIRUSTOTAL
+:: Queries VirusTotal API for domain reputation
+:: ============================================================
+set "VT_DOMAIN=%~1"
+
+for /f "tokens=*" %%R in ('powershell -NoProfile -Command ^
+    "try { " ^
+    "  $domain = '%VT_DOMAIN%'; " ^
+    "  $apiKey = '%VT_API_KEY%'; " ^
+    "  $headers = @{'x-apikey'=$apiKey}; " ^
+    "  $res = Invoke-RestMethod -Uri ('https://www.virustotal.com/api/v3/domains/' + $domain) -Headers $headers -Method GET -TimeoutSec 5; " ^
+    "  $malicious = $res.data.attributes.last_analysis_stats.malicious; " ^
+    "  $suspicious = $res.data.attributes.last_analysis_stats.suspicious; " ^
+    "  if ($malicious -gt 0 -or $suspicious -gt 2) { Write-Output ('VT_POSITIVE:malicious=' + $malicious + ':suspicious=' + $suspicious) } else { Write-Output 'VT_CLEAN' } " ^
+    "} catch { Write-Output 'VT_ERROR' }"') do (
+    set "VT_RESULT=%%R"
+)
+
+if "!VT_RESULT!"=="VT_CLEAN" (
+    echo [%TIME%] VirusTotal: !VT_DOMAIN! - CLEAN
+) else if "!VT_RESULT!"=="VT_ERROR" (
+    echo [%TIME%] VirusTotal: Could not reach API
+) else if not "!VT_RESULT!"=="" (
+    call :LOG_THREAT "VIRUSTOTAL" "!VT_DOMAIN!" "VirusTotal flagged domain: !VT_RESULT!" "CRITICAL"
+)
+
+exit /b
+
+:: ============================================================
+:CHECK_SUSPICIOUS_PROCESSES
+:: Scans all running processes for suspicious behavior
+:: ============================================================
+powershell -NoProfile -Command ^
+    "$suspicious = @(); " ^
+    "$procs = Get-Process | Where-Object {$_.Path -ne $null} | Select-Object Name, Path, CPU, WorkingSet; " ^
+    "foreach ($p in $procs) { " ^
+    "  $path = $p.Path; " ^
+    "  if ($path -match '\\\\AppData\\\\' -and $path -match '\.exe$') { $suspicious += ('APPDATA_EXE:' + $p.Name + ':' + $path) }; " ^
+    "  if ($path -match '\\\\Temp\\\\' -and $path -match '\.exe$') { $suspicious += ('TEMP_EXE:' + $p.Name + ':' + $path) }; " ^
+    "  if ($p.Name -match '^[a-z0-9]{8,16}$' -and $p.Name.Length -ge 10) { $suspicious += ('RANDOM_NAME:' + $p.Name + ':' + $path) } " ^
+    "}; " ^
+    "foreach ($s in $suspicious) { Write-Output $s }" > "%TEMP%\proc_scan.txt" 2>nul
+
+for /f "tokens=*" %%L in (%TEMP%\proc_scan.txt) do (
+    for /f "tokens=1,2,3 delims=:" %%A in ("%%L") do (
+        if "%%A"=="APPDATA_EXE" call :LOG_THREAT "PROCESS" "%%B" "Executable running from AppData folder (common malware location): %%C" "HIGH"
+        if "%%A"=="TEMP_EXE" call :LOG_THREAT "PROCESS" "%%B" "Executable running from Temp folder (suspicious): %%C" "HIGH"
+        if "%%A"=="RANDOM_NAME" call :LOG_THREAT "PROCESS" "%%B" "Process has randomized/obfuscated name pattern (possible malware): %%C" "MEDIUM"
+    )
+)
+
+exit /b
+
+:: ============================================================
+:CHECK_NETWORK_CONNECTIONS
+:: Checks active outbound connections for suspicious endpoints
+:: ============================================================
+powershell -NoProfile -Command ^
+    "$conns = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | " ^
+    "  Select-Object LocalPort, RemoteAddress, RemotePort, OwningProcess; " ^
+    "foreach ($c in $conns) { " ^
+    "  $remoteIP = $c.RemoteAddress; " ^
+    "  $remotePort = $c.RemotePort; " ^
+    "  $pid = $c.OwningProcess; " ^
+    "  try { $pname = (Get-Process -Id $pid -ErrorAction SilentlyContinue).Name } catch { $pname = 'unknown' }; " ^
+    "  $suspPorts = @(1080,4444,5555,6666,7777,8888,9999,31337,12345,54321); " ^
+    "  if ($suspPorts -contains $remotePort) { Write-Output ('SUSP_PORT:' + $pname + ':' + $remoteIP + ':' + $remotePort) }; " ^
+    "  if ($remoteIP -match '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' -eq $false -and $remoteIP -ne '127.0.0.1' -and $remotePort -eq 4444) { Write-Output ('METASPLOIT_PORT:' + $pname + ':' + $remoteIP) } " ^
+    "}" > "%TEMP%\net_scan.txt" 2>nul
+
+for /f "tokens=*" %%L in (%TEMP%\net_scan.txt) do (
+    for /f "tokens=1,2,3,4 delims=:" %%A in ("%%L") do (
+        if "%%A"=="SUSP_PORT" call :LOG_THREAT "NETWORK" "%%B" "Suspicious outbound connection to %%C:%%D (known RAT/backdoor port)" "HIGH"
+        if "%%A"=="METASPLOIT_PORT" call :LOG_THREAT "NETWORK" "%%B" "Possible Metasploit/RAT connection detected to %%C:4444" "CRITICAL"
+    )
+)
+
+exit /b
+
+:: ============================================================
+:LOG_THREAT
+:: Logs a detected threat to file and shows alert
+:: Usage: CALL :LOG_THREAT "TYPE" "TARGET" "DESCRIPTION" "SEVERITY"
+:: ============================================================
+set "THREAT_TYPE=%~1"
+set "THREAT_TARGET=%~2"
+set "THREAT_DESC=%~3"
+set "THREAT_SEVERITY=%~4"
+
+set "LOG_LINE=[%DATE% %TIME%] [%THREAT_SEVERITY%] [%THREAT_TYPE%] TARGET: %THREAT_TARGET% | %THREAT_DESC%"
+
+echo !LOG_LINE! >> "%LOG_FILE%"
+echo !LOG_LINE! >> "%ALERT_FILE%"
+
+echo.
+echo  ╔══════════════════════════════════════════════════════╗
+echo  ║  ⚠ THREAT DETECTED [%THREAT_SEVERITY%]                          ║
+echo  ║  Type    : %THREAT_TYPE%
+echo  ║  Target  : %THREAT_TARGET%
+echo  ║  Details : %THREAT_DESC%
+echo  ╚══════════════════════════════════════════════════════╝
+echo.
+
+:: Optional popup alert for CRITICAL threats
+if "%THREAT_SEVERITY%"=="CRITICAL" (
+    powershell -NoProfile -Command ^
+        "[System.Windows.Forms.MessageBox]::Show('CRITICAL THREAT DETECTED!`n`nType: %THREAT_TYPE%`nTarget: %THREAT_TARGET%`n%THREAT_DESC%`n`nCheck logs\threat_log.txt for details.', 'Malware Monitor ALERT', 'OK', 'Error')" ^
+        -command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('%THREAT_DESC%', 'CRITICAL THREAT - %THREAT_TARGET%', 'OK', 'Error')" >nul 2>&1
+)
+
+exit /b
